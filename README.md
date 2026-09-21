@@ -5,8 +5,8 @@ Small helper for controlling fan PWM on a Fujitsu PRIMERGY TX1320 M4 through loc
 Tested environment:
 
 - FUJITSU PRIMERGY TX1320 M4
-- iRMC S5 Firmware Revision 3.31P (1.00)
-- SDR 3.40
+- iRMC S5 Firmware Revision 3.65P (1.00)
+- SDR 3.44
 
 Other iRMC firmware versions and other PRIMERGY models are not guaranteed.
 
@@ -51,11 +51,19 @@ No pip, no venv, no Python package install. The project is just two standalone s
 
 ## Manual Control
 
-Set all PWM channels to 40%:
+Set CPU channel to 40%:
 
 ```bash
-/usr/local/sbin/irmc_fan.py set 40
+/usr/local/sbin/irmc_fan.py set --cpu 40
 ```
+
+Set SYS channel to 50%:
+
+```bash
+/usr/local/sbin/irmc_fan.py set --system 50
+```
+
+Setting PSU values is removed from latest version, as the tool won't go under the PSU's internal lower limit anyway.
 
 Show fan SDR readings:
 
@@ -63,10 +71,13 @@ Show fan SDR readings:
 /usr/local/sbin/irmc_fan.py sdr
 ```
 
+Note: the column before the RPM value is not the PWM value, it's the IPMI instance id!
+
 Clear forced PWM and return to iRMC automatic control:
 
 ```bash
-/usr/local/sbin/irmc_fan.py clear
+/usr/local/sbin/irmc_fan.py clear --cpu
+/usr/local/sbin/irmc_fan.py clear --system
 ```
 
 Read force slots:
