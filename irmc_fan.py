@@ -1,152 +1,207 @@
 #!/usr/bin/env python3
+"""TX1320 M4 iRMC fan control using the hardware-tested Fujitsu PW protocol.
+
+Writes are restricted to system slot 1 and CPU slot 2. PSU slot 12 is read-only.
+Percent means requested PWM, not percent of maximum RPM. Overrides can reduce
+cooling below automatic control; they persist after this program exits. Use clear
+explicitly. This is a manual override tool, not a temperature-control daemon.
+Requires Python 3.9+ and local ipmitool access (normally sudo, interface open).
+"""
 import argparse
+import math
+import shlex
 import subprocess
-import sys
 import time
 
+IANA = [0x80, 0x28, 0x00]
+CPU, SYSTEM = 2, 1
+WRITABLE_SLOTS = {CPU, SYSTEM}
+LABELS = {
+    CPU: 'CPU', SYSTEM: 'System',
+    3: 'Performance profile', 5: 'Emergency profile',
+    12: 'PSUs (read-only)',
+}
 
-IANA_FUJITSU = [0x80, 0x28, 0x00]
-OEM_NETFN = "0x2e"
-OEM_CMD = "0xf5"
+
+def percent_to_raw(percent):
+    """Round a 0..100 percent request to the nearest 8-bit PWM value."""
+    if not math.isfinite(percent) or not 0 <= percent <= 100:
+        raise ValueError('percentage must be finite and in range 0..100')
+    return int(percent * 255 / 100 + 0.5)
 
 
-def hx(value: int) -> str:
-    return f"0x{value & 0xff:02x}"
+def write_payload(slot, value=None):
+    """PW: omit value to release one override; zero instead forces zero PWM.
+
+    Enforce the slot allowlist here, at the payload boundary. No broadcast or
+    arbitrary-slot write facility is provided, including for clear operations.
+    """
+    if slot not in WRITABLE_SLOTS:
+        raise ValueError('writes are limited to CPU slot 2 and system slot 1')
+    if value is not None and (not isinstance(value, int) or not 0 <= value <= 255):
+        raise ValueError('raw PWM must be an integer in range 0..255')
+    return IANA + [0x2d, ord('P'), ord('W'), slot] + ([] if value is None else [value])
 
 
-def parse_hex_bytes(text: str) -> list[int]:
-    out: list[int] = []
-    for token in text.replace("\n", " ").split():
+def read_payload(indices):
+    if not 1 <= len(indices) <= 31 or any(not 0 <= i <= 31 for i in indices):
+        raise ValueError('read requires 1..31 indices in range 0..31')
+    return IANA + [0x2d, ord('F'), ord('R'), 1, len(indices)] + [v for i in indices for v in (i, 0)]
+
+
+def run(args, tail):
+    cmd = [args.ipmitool, '-I', args.interface] + tail
+    if args.dry_run:
+        print(shlex.join(cmd))
+        return None
+    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=30)
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f'ipmitool exit {proc.returncode}')
+    return proc.stdout
+
+
+def raw(args, payload):
+    out = run(args, ['raw', '0x2e', '0xf5'] + [f'0x{x:02x}' for x in payload])
+    if out is None:
+        return None
+    try:
+        result = [int(t, 16) for t in out.split()]
+    except ValueError as exc:
+        raise RuntimeError(f'Unexpected non-hex response: {out!r}') from exc
+    if any(not 0 <= b <= 255 for b in result) or result[:3] != IANA:
+        raise RuntimeError(f'Unexpected OEM response: {out!r}')
+    return result
+
+
+def decode_read(result, indices):
+    """FR returns IANA/version/count followed by (index+flags, cached byte)."""
+    if result[:3] != IANA or len(result) != 5 + 2 * len(indices) or result[3:5] != [1, len(indices)]:
+        raise RuntimeError(f'Unexpected FR response length/header: {result}')
+    rows = []
+    for i, expected in enumerate(indices):
+        flags, value = result[5+2*i:7+2*i]
+        if flags & 0x3f != expected:
+            raise RuntimeError('FR response index mismatch')
+        rows.append((expected, bool(flags & 0x40), bool(flags & 0x80), value))
+    return rows
+
+
+def cached_percent(slot, value):
+    # Only apply scales established for this board. Inactive slots may be stale.
+    if slot in WRITABLE_SLOTS:
+        return f'{value * 100 / 255:.1f}% PWM'
+    if slot == 12:
+        return f'{value}% PSU request' if value <= 100 else 'out of PSU range'
+    return 'unknown scale'
+
+
+def read(args, indices=None):
+    if indices is None:
+        indices = list(range(32))
+    if any(not 0 <= i <= 31 for i in indices):
+        raise ValueError('read indices must be in range 0..31')
+    print(f'{"Slot":6}{"Control":22}{"Active":8}{"Forced":8}{"Cached raw":12}Cached request')
+    for start in range(0, len(indices), 16):
+        batch = indices[start:start+16]
+        result = raw(args, read_payload(batch))
+        if result is not None:
+            for slot, active, forced, value in decode_read(result, batch):
+                text = cached_percent(slot, value) if active else 'inactive / possibly stale'
+                print(f'{slot:02d}    {LABELS.get(slot, "Unmapped"):22}{str(active):8}{str(forced):8}{value:<12} {text}')
+    print('Cached requests are software values, not measured duty or RPM. PSU requests use 0..100; CPU/system use 0..255.')
+
+
+def fans(args):
+    out = run(args, ['sdr', 'type', 'fan'])
+    if out is not None:
+        print(out, end='' if out.endswith('\n') else '\n')
+
+
+def change(args, targets):
+    """Write sequentially; preserve already-applied changes if a later call fails.
+
+    PW acknowledgement contains active/forced bitmaps for slots 0..7. Verify
+    only the selected bit. Acknowledgement does not verify physical fan speed.
+    """
+    for slot, value in targets:
+        print(f'{LABELS[slot]} (slot {slot}): ' + ('restore automatic control' if value is None else f'request {value*100/255:.1f}% PWM, raw {value} (0x{value:02x})'), flush=True)
         try:
-            out.append(int(token, 16))
-        except ValueError:
-            pass
-    return out
+            result = raw(args, write_payload(slot, value))
+            if result is not None:
+                if len(result) != 5 or not result[3] & (1 << slot):
+                    raise RuntimeError(f'unexpected PW acknowledgement or inactive slot: {result}')
+                if bool(result[4] & (1 << slot)) != (value is not None):
+                    raise RuntimeError(f'override state did not match request: {result}')
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f'{exc}. Some requests may already have applied; inspect readout and use clear --cpu / --system as needed.') from exc
+    if not args.dry_run:
+        time.sleep(2)
+    read(args, [slot for slot, _ in targets])
+    fans(args)
 
 
-def ipmitool_base(args: argparse.Namespace) -> list[str]:
-    return [args.ipmitool, "-I", args.interface]
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--ipmitool', default='ipmitool')
+    p.add_argument('-I', '--interface', default='open')
+    p.add_argument('--dry-run', action='store_true', help='print commands without executing them')
+    subs = p.add_subparsers(dest='command', required=True)
+    s = subs.add_parser('set', help='set CPU and/or system PWM percentages; unspecified fans are untouched')
+    s.add_argument('--cpu', type=float, metavar='PERCENT')
+    s.add_argument('--system', type=float, metavar='PERCENT')
+    s.add_argument('--allow-low', action='store_true', help='permit requests below 10%%; this threshold is not a hardware safety guarantee')
+    c = subs.add_parser('clear', help='return selected CPU/system controls to automatic')
+    c.add_argument('--cpu', action='store_true')
+    c.add_argument('--system', action='store_true')
+    r = subs.add_parser('read', help='read all slots or selected decimal/hex indices')
+    r.add_argument('indices', nargs='*', type=lambda s: int(s, 0))
+    subs.add_parser('sdr', help='show fan RPM sensors')
+    w = subs.add_parser('watch', help='repeat control readout and fan RPM readings')
+    w.add_argument('-n', '--interval', type=float, default=5)
+    return p
 
 
-def run_raw(args: argparse.Namespace, data: list[int]) -> list[int]:
-    cmd = ipmitool_base(args) + ["raw", OEM_NETFN, OEM_CMD] + [hx(x) for x in data]
-    if args.dry_run:
-        print(" ".join(cmd))
-        return []
-
-    proc = subprocess.run(cmd, text=True, capture_output=True)
-    if proc.returncode != 0:
-        if proc.stdout:
-            print(proc.stdout, end="")
-        if proc.stderr:
-            print(proc.stderr, end="", file=sys.stderr)
-        raise SystemExit(proc.returncode)
-
-    if proc.stdout.strip():
-        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
-    return parse_hex_bytes(proc.stdout)
-
-
-def raw_read(args: argparse.Namespace, indices: list[int]) -> list[int]:
-    if not 1 <= len(indices) <= 31:
-        raise SystemExit("read index count must be 1..31")
-    payload = IANA_FUJITSU + [0x2d, ord("F"), ord("R"), 0x01, len(indices)]
-    for idx in indices:
-        if not 0 <= idx <= 31:
-            raise SystemExit(f"PWM index out of range 0..31: {idx}")
-        payload += [idx, 0x00]
-    return run_raw(args, payload)
-
-
-def raw_set_all(args: argparse.Namespace, percent: int) -> list[int]:
-    if not 0 <= percent <= 100:
-        raise SystemExit("percent must be 0..100")
-    if percent < 30 and not args.allow_low:
-        raise SystemExit("refusing to set below 30%; pass --allow-low if you really want that")
-    payload = IANA_FUJITSU + [0x2d, ord("F"), ord("W"), 0x01, 0xff, 0x80, percent]
-    return run_raw(args, payload)
+def main(argv=None):
+    p = build_parser()
+    a = p.parse_args(argv)
+    if a.command == 'set':
+        targets = []
+        for slot, percent in [(CPU, a.cpu), (SYSTEM, a.system)]:
+            if percent is not None:
+                try:
+                    value = percent_to_raw(percent)
+                except ValueError as exc:
+                    p.error(str(exc))
+                if percent < 10 and not a.allow_low:
+                    p.error('requests below 10% require --allow-low')
+                targets.append((slot, value))
+        if not targets:
+            p.error('set requires --cpu and/or --system')
+        # Validate every argument before executing the first write.
+        change(a, targets)
+    elif a.command == 'clear':
+        targets = [(slot, None) for slot, selected in [(CPU, a.cpu), (SYSTEM, a.system)] if selected]
+        if not targets:
+            p.error('clear requires --cpu and/or --system')
+        change(a, targets)
+    elif a.command == 'read':
+        read(a, a.indices or None)
+    elif a.command == 'sdr':
+        fans(a)
+    else:
+        if not math.isfinite(a.interval) or a.interval <= 0:
+            p.error('interval must be finite and positive')
+        while True:
+            print(time.strftime('%Y-%m-%d %H:%M:%S'))
+            read(a, [SYSTEM, CPU, 12])
+            fans(a)
+            time.sleep(a.interval)
 
 
-def raw_clear_all(args: argparse.Namespace) -> list[int]:
-    payload = IANA_FUJITSU + [0x2d, ord("F"), ord("W"), 0x01, 0xff, 0x00, 0x00]
-    return run_raw(args, payload)
-
-
-def show_fans(args: argparse.Namespace) -> None:
-    cmd = ipmitool_base(args) + ["sdr", "type", "fan"]
-    if args.dry_run:
-        print(" ".join(cmd))
-        return
-    subprocess.run(cmd, check=False)
-
-
-def cmd_set(args: argparse.Namespace) -> None:
-    raw_set_all(args, args.percent)
-    show_fans(args)
-
-
-def cmd_clear(args: argparse.Namespace) -> None:
-    raw_clear_all(args)
-    show_fans(args)
-
-
-def cmd_read(args: argparse.Namespace) -> None:
-    raw_read(args, args.indices)
-
-
-def cmd_sdr(args: argparse.Namespace) -> None:
-    show_fans(args)
-
-
-def cmd_watch(args: argparse.Namespace) -> None:
-    while True:
-        print(time.strftime("%Y-%m-%d %H:%M:%S"))
-        show_fans(args)
-        time.sleep(args.interval)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Control Fujitsu PRIMERGY TX1320 M4 iRMC S5 fan PWM via local ipmitool."
-    )
-    parser.add_argument("--ipmitool", default="ipmitool")
-    parser.add_argument("-I", "--interface", default="open")
-    parser.add_argument("--dry-run", action="store_true")
-
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_set = sub.add_parser("set", help="force all PWM channels to a percent")
-    p_set.add_argument("percent", type=int, help="PWM duty percent, for example 40")
-    p_set.add_argument("--allow-low", action="store_true", help="allow values below 30%")
-    p_set.set_defaults(func=cmd_set)
-
-    p_clear = sub.add_parser("clear", help="clear all PWM force and return to automatic control")
-    p_clear.set_defaults(func=cmd_clear)
-
-    p_read = sub.add_parser("read", help="read selected PWM force slots")
-    p_read.add_argument(
-        "indices",
-        nargs="*",
-        type=lambda s: int(s, 0),
-        default=[0x00, 0x01, 0x19, 0x1a],
-        help="PWM indices, default: 0 1 0x19 0x1a",
-    )
-    p_read.set_defaults(func=cmd_read)
-
-    p_sdr = sub.add_parser("sdr", help="show fan SDR readings")
-    p_sdr.set_defaults(func=cmd_sdr)
-
-    p_watch = sub.add_parser("watch", help="repeat fan SDR readings")
-    p_watch.add_argument("-n", "--interval", type=float, default=5.0)
-    p_watch.set_defaults(func=cmd_watch)
-
-    return parser
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    args.func(args)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit('Interrupted. Existing overrides remain active; use clear explicitly.')
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(str(exc))
